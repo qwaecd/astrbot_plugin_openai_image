@@ -1,0 +1,7 @@
+name: astrbot_plugin_remote_debugger
+display_name: AstrBot Remote Debugger
+desc: 用于远程调试插件的帮助插件
+version: v1.0.0
+author: qwaecd
+repo: null # 插件的仓库地址
+astrbot_version: ">=4.16,<5"
