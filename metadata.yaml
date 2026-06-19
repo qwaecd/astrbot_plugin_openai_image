@@ -1,7 +1,7 @@
-name: astrbot_plugin_remote_debugger
-display_name: AstrBot Remote Debugger
-desc: 用于远程调试插件的帮助插件
+name: astrbot_plugin_openai_image
+display_name: OpenAI Image Generator
+desc: 使用 OpenAI Images API 进行文生图的 AstrBot 插件
 version: v1.0.0
 author: qwaecd
-repo: null # 插件的仓库地址
+repo: null
 astrbot_version: ">=4.16,<5"

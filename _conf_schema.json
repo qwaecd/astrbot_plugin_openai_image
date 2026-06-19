@@ -1,0 +1,77 @@
+{
+  "enabled": {
+    "description": "是否启用 OpenAI 生图插件",
+    "type": "bool",
+    "default": true
+  },
+  "api_key": {
+    "description": "OpenAI API Key",
+    "type": "string",
+    "default": "",
+    "hint": "填写 sk- 开头的 OpenAI API Key",
+    "obvious_hint": true
+  },
+  "proxy": {
+    "description": "代理地址",
+    "type": "string",
+    "default": "",
+    "hint": "例如 http://127.0.0.1:7890；留空则不使用代理"
+  },
+  "model": {
+    "description": "生图模型",
+    "type": "string",
+    "default": "gpt-image-1",
+    "hint": "默认使用 OpenAI 图像生成模型 gpt-image-1"
+  },
+  "api_base": {
+    "description": "OpenAI API Base",
+    "type": "string",
+    "default": "https://api.openai.com/v1",
+    "hint": "一般无需修改；如使用兼容服务，可填写到 /v1 或完整 /images/generations"
+  },
+  "size": {
+    "description": "图片尺寸",
+    "type": "string",
+    "default": "1024x1024",
+    "enum": [
+      "1024x1024",
+      "1024x1536",
+      "1536x1024",
+      "1792x1024",
+      "1024x1792",
+      "auto"
+    ],
+    "hint": "不同模型支持的尺寸不同；gpt-image-1 推荐 1024x1024、1024x1536、1536x1024"
+  },
+  "quality": {
+    "description": "图片质量",
+    "type": "string",
+    "default": "auto",
+    "enum": [
+      "auto",
+      "low",
+      "medium",
+      "high",
+      "standard",
+      "hd"
+    ],
+    "hint": "gpt-image-1 支持 auto/low/medium/high；DALL-E 3 支持 standard/hd"
+  },
+  "output_format": {
+    "description": "输出格式",
+    "type": "string",
+    "default": "png",
+    "enum": [
+      "png",
+      "jpeg",
+      "webp"
+    ],
+    "hint": "仅对 gpt-image 系列模型传递"
+  },
+  "timeout": {
+    "description": "请求超时时间（秒）",
+    "type": "int",
+    "default": 120,
+    "hint": "生图可能较慢，建议 60-180 秒"
+  }
+}
