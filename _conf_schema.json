@@ -13,6 +13,27 @@
     "hint": "用于管理员指令查询组织用量/费用；需要在 OpenAI 平台创建具备组织权限的 Admin API Key，不要填写普通项目 API Key",
     "obvious_hint": true
   },
+  "whitelist_enabled": {
+    "description": "启用用户白名单",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，只有白名单中的用户/会话可以使用本插件；白名单为空时不限制"
+  },
+  "whitelist_users": {
+    "description": "用户白名单",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": [],
+    "hint": "填写允许使用本插件的 UID；也兼容填写 UMO 或 Session ID。可使用 /sid 查看 UID/UMO"
+  },
+  "whitelist_admin_bypass": {
+    "description": "管理员无视白名单",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后 AstrBot 管理员即使不在白名单中也可以使用本插件"
+  },
   "proxy": {
     "description": "代理地址",
     "type": "string",

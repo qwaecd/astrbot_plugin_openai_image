@@ -63,10 +63,14 @@ class OpenaiImage(Star):
     async def initialize(self):
         await self._ensure_client()
         logger.info(
-            "[OpenAI Image] 插件初始化完成: model=%s, api_base=%s, proxy=%s",
+            "[OpenAI Image] 插件初始化完成: model=%s, api_base=%s, proxy=%s, "
+            "whitelist_enabled=%s, whitelist_count=%d, whitelist_admin_bypass=%s",
             self._get_str("model", DEFAULT_MODEL),
             self._get_str("api_base", DEFAULT_API_BASE),
             self._describe_proxy(),
+            self._get_bool("whitelist_enabled", False),
+            len(self._get_list("whitelist_users")),
+            self._get_bool("whitelist_admin_bypass", True),
         )
 
     async def terminate(self):
@@ -75,6 +79,9 @@ class OpenaiImage(Star):
 
     @filter.command("画图", alias={"生图", "image", "draw"})
     async def generate_image(self, event: AstrMessageEvent, prompt: GreedyStr):
+        if not await self._ensure_whitelist_allowed(event, "生图"):
+            return
+
         prompt_text = str(prompt or "").strip()
         if not prompt_text:
             await event.send(
@@ -135,6 +142,9 @@ class OpenaiImage(Star):
 
     @filter.command("改图", alias={"编辑图片", "edit", "edit_image"})
     async def edit_image(self, event: AstrMessageEvent, prompt: GreedyStr):
+        if not await self._ensure_whitelist_allowed(event, "改图"):
+            return
+
         prompt_text = str(prompt or "").strip()
         if not prompt_text:
             await event.send(
@@ -206,6 +216,9 @@ class OpenaiImage(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("图片用量", alias={"openai_usage", "image_usage", "生图用量"})
     async def image_usage(self, event: AstrMessageEvent, args: GreedyStr = ""):
+        if not await self._ensure_whitelist_allowed(event, "查询图片用量"):
+            return
+
         admin_api_key = self._get_str("admin_api_key")
         if not admin_api_key:
             await event.send(
@@ -791,6 +804,46 @@ class OpenaiImage(Star):
             return f"{title}。"
         return f"{title}，" + "，".join(details) + "。"
 
+    async def _ensure_whitelist_allowed(
+        self, event: AstrMessageEvent, action: str
+    ) -> bool:
+        if self._is_whitelist_allowed(event):
+            return True
+
+        sender_id = str(event.get_sender_id()).strip()
+        umo = str(event.unified_msg_origin).strip()
+        logger.info(
+            "[OpenAI Image] 白名单拦截: action=%s, sender_id=%s, umo=%s, role=%s",
+            action,
+            sender_id or "unknown",
+            umo or "unknown",
+            getattr(event, "role", "unknown"),
+        )
+        await event.send(
+            MessageChain().message(
+                "你不在 OpenAI 生图插件白名单中，无法使用该功能。"
+                "可使用 /sid 查看 UID 后请管理员添加。"
+            )
+        )
+        return False
+
+    def _is_whitelist_allowed(self, event: AstrMessageEvent) -> bool:
+        if not self._get_bool("whitelist_enabled", False):
+            return True
+
+        whitelist = set(self._get_list("whitelist_users"))
+        if not whitelist:
+            return True
+
+        if self._get_bool("whitelist_admin_bypass", True) and event.is_admin():
+            return True
+
+        sender_id = str(event.get_sender_id()).strip()
+        session_id = str(event.get_session_id()).strip()
+        umo = str(event.unified_msg_origin).strip()
+        candidates = {item for item in (sender_id, session_id, umo) if item}
+        return bool(candidates & whitelist)
+
     def _get_str(self, key: str, default: str = "") -> str:
         value = self.config.get(key, default)
         if value is None:
@@ -811,6 +864,32 @@ class OpenaiImage(Star):
                 default,
             )
             return default
+
+    def _get_bool(self, key: str, default: bool = False) -> bool:
+        value = self.config.get(key, default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes", "on", "enable", "enabled"}:
+                return True
+            if normalized in {"false", "0", "no", "off", "disable", "disabled", ""}:
+                return False
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return default
+
+    def _get_list(self, key: str) -> list[str]:
+        value = self.config.get(key, [])
+        if value is None:
+            return []
+        if isinstance(value, str):
+            raw_items = re.split(r"[\s,;，；]+", value)
+        elif isinstance(value, (list, tuple, set)):
+            raw_items = list(value)
+        else:
+            raw_items = [value]
+        return [str(item).strip() for item in raw_items if str(item).strip()]
 
     def _get_proxy(self) -> str:
         proxy = self._get_str("proxy")

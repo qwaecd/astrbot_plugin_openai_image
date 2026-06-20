@@ -8,6 +8,9 @@ AstrBot OpenAI 文生图插件。插件通过异步 HTTP 请求直接调用 Open
 
 - `api_key`: OpenAI API Key
 - `admin_api_key`: OpenAI Admin API Key，仅用于管理员查询用量/费用；普通生图不需要填写
+- `whitelist_enabled`: 是否启用本插件的用户白名单，默认关闭
+- `whitelist_users`: 允许使用本插件的 UID 列表，也兼容 UMO 或 Session ID；可使用 `/sid` 查看
+- `whitelist_admin_bypass`: AstrBot 管理员是否无视本插件白名单，默认开启
 - `proxy`: 代理地址，可留空，例如 `http://127.0.0.1:7890`。也可填写 `127.0.0.1:7890`，插件会按 HTTP 代理处理；使用 TUN 模式时建议留空
 - `model`: 图像模型，默认 `gpt-image-1`
 - `size`: 图片尺寸，默认 `1024x1024`
@@ -16,6 +19,8 @@ AstrBot OpenAI 文生图插件。插件通过异步 HTTP 请求直接调用 Open
 - `timeout`: 请求超时时间，默认 120 秒
 
 `api_base` 默认是 `https://api.openai.com/v1`，一般无需修改。
+
+当 `whitelist_enabled` 开启且 `whitelist_users` 不为空时，插件会在生图、改图和图片用量查询前检查白名单；未通过时不会请求 OpenAI。`whitelist_users` 为空时不启用白名单限制。
 
 ## 使用
 
