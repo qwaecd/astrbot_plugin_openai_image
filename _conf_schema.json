@@ -6,6 +6,13 @@
     "hint": "填写 sk- 开头的 OpenAI API Key",
     "obvious_hint": true
   },
+  "admin_api_key": {
+    "description": "OpenAI Admin API Key",
+    "type": "string",
+    "default": "",
+    "hint": "用于管理员指令查询组织用量/费用；需要在 OpenAI 平台创建具备组织权限的 Admin API Key，不要填写普通项目 API Key",
+    "obvious_hint": true
+  },
   "proxy": {
     "description": "代理地址",
     "type": "string",

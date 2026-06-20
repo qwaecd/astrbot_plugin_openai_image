@@ -3,7 +3,8 @@ from __future__ import annotations
 import base64
 import re
 from dataclasses import dataclass
-from time import monotonic
+from datetime import datetime
+from time import monotonic, time
 from typing import Any
 
 import httpx
@@ -31,10 +32,25 @@ class OpenAIImageAPIError(Exception):
     """OpenAI image API returned an error response."""
 
 
+class OpenAIUsageAPIError(Exception):
+    """OpenAI usage API returned an error response."""
+
+
 @dataclass(slots=True)
 class ImageAPIResult:
     base64_image: str
     total_tokens: int | None = None
+
+
+@dataclass(slots=True)
+class ImageUsageSummary:
+    days: int
+    start_time: int
+    end_time: int
+    images: int = 0
+    requests: int = 0
+    by_api_key: dict[str, dict[str, int]] | None = None
+    costs_by_currency: dict[str, float] | None = None
 
 
 class OpenaiImage(Star):
@@ -187,6 +203,56 @@ class OpenaiImage(Star):
             )
         )
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("图片用量", alias={"openai_usage", "image_usage", "生图用量"})
+    async def image_usage(self, event: AstrMessageEvent, args: GreedyStr = ""):
+        admin_api_key = self._get_str("admin_api_key")
+        if not admin_api_key:
+            await event.send(
+                MessageChain().message(
+                    "请先在插件配置中填写 OpenAI Admin API Key。"
+                )
+            )
+            return
+
+        days = self._parse_usage_days(str(args or ""))
+        try:
+            logger.info(
+                "[OpenAI Image] 管理员查询图片用量: days=%d, proxy=%s",
+                days,
+                self._describe_proxy(),
+            )
+            await event.send(MessageChain().message("正在查询 OpenAI 图片用量，请稍等..."))
+            started_at = monotonic()
+            summary = await self._get_image_usage_summary(admin_api_key, days)
+            elapsed_seconds = monotonic() - started_at
+        except OpenAIUsageAPIError as exc:
+            await event.send(MessageChain().message(f"查询图片用量失败：{exc}"))
+            return
+        except Exception as exc:
+            if is_connection_error(exc):
+                log_connection_failure("OpenAI Image", exc, self._get_proxy())
+                await event.send(
+                    MessageChain().message(
+                        self._format_connection_error_message("查询图片用量", exc)
+                    )
+                )
+                return
+
+            logger.exception("OpenAI image usage query failed.")
+            await event.send(MessageChain().message(f"查询图片用量请求失败：{exc}"))
+            return
+
+        logger.info(
+            "[OpenAI Image] 图片用量查询完成: elapsed=%.2fs, images=%d, requests=%d",
+            elapsed_seconds,
+            summary.images,
+            summary.requests,
+        )
+        await event.send(
+            MessageChain().message(self._format_usage_summary(summary, elapsed_seconds))
+        )
+
     async def _create_image(self, prompt: str, api_key: str) -> ImageAPIResult:
         client = await self._ensure_client()
         payload = self._build_payload(prompt)
@@ -267,6 +333,90 @@ class OpenaiImage(Star):
         )
 
         return await self._extract_image_from_response(response, client, timeout)
+
+    async def _get_image_usage_summary(
+        self, admin_api_key: str, days: int
+    ) -> ImageUsageSummary:
+        end_time = int(time())
+        start_time = end_time - days * 86400
+
+        usage_data = await self._fetch_admin_usage(
+            "organization/usage/images",
+            admin_api_key,
+            {
+                "start_time": start_time,
+                "end_time": end_time,
+                "bucket_width": "1d",
+                "group_by": "api_key_id",
+                "limit": min(days, 180),
+            },
+        )
+        summary = self._summarize_image_usage(usage_data, days, start_time, end_time)
+
+        try:
+            costs_data = await self._fetch_admin_usage(
+                "organization/costs",
+                admin_api_key,
+                {
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "bucket_width": "1d",
+                    "group_by": "api_key_id",
+                    "limit": min(days, 180),
+                },
+            )
+            summary.costs_by_currency = self._summarize_costs(costs_data)
+        except OpenAIUsageAPIError as exc:
+            logger.warning("[OpenAI Image] 费用查询失败，仅返回图片用量: %s", exc)
+
+        return summary
+
+    async def _fetch_admin_usage(
+        self, endpoint: str, admin_api_key: str, params: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        client = await self._ensure_client()
+        api_url = self._build_api_url(endpoint)
+        timeout = self._get_int("timeout", 120)
+        all_buckets: list[dict[str, Any]] = []
+        request_params = dict(params)
+
+        for page_index in range(20):
+            logger.info(
+                "[OpenAI Image] 发送管理员用量请求: url=%s, page=%d, proxy=%s",
+                api_url,
+                page_index + 1,
+                self._describe_proxy(),
+            )
+            request_started_at = monotonic()
+            response = await client.get(
+                api_url,
+                headers={"Authorization": f"Bearer {admin_api_key}"},
+                params=request_params,
+                timeout=timeout,
+            )
+            logger.info(
+                "[OpenAI Image] 管理员用量请求返回: endpoint=%s, status=%s, elapsed=%.2fs",
+                endpoint,
+                response.status_code,
+                monotonic() - request_started_at,
+            )
+            data = self._parse_usage_json_response(response)
+            buckets = data.get("data")
+            if not isinstance(buckets, list):
+                raise OpenAIUsageAPIError("OpenAI 用量 API 返回中没有 data 列表。")
+            all_buckets.extend(bucket for bucket in buckets if isinstance(bucket, dict))
+
+            if not data.get("has_more"):
+                break
+            next_page = data.get("next_page")
+            if not isinstance(next_page, str) or not next_page:
+                logger.warning("[OpenAI Image] 用量 API 标记有下一页，但没有 next_page。")
+                break
+            request_params["page"] = next_page
+        else:
+            logger.warning("[OpenAI Image] 用量 API 分页超过 20 页，已停止继续查询。")
+
+        return all_buckets
 
     async def _extract_image_from_response(
         self,
@@ -445,6 +595,22 @@ class OpenaiImage(Star):
         return data
 
     @staticmethod
+    def _parse_usage_json_response(response: httpx.Response) -> dict[str, Any]:
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise OpenAIUsageAPIError(
+                f"OpenAI 返回了非 JSON 响应，HTTP {response.status_code}。"
+            ) from exc
+        if not isinstance(data, dict):
+            raise OpenAIUsageAPIError("OpenAI 返回的 JSON 不是对象。")
+        if response.status_code >= 400:
+            raise OpenAIUsageAPIError(
+                OpenaiImage._extract_error_message(data, response)
+            )
+        return data
+
+    @staticmethod
     def _extract_error_message(data: dict[str, Any], response: httpx.Response) -> str:
         error = data.get("error")
         if isinstance(error, dict):
@@ -472,6 +638,143 @@ class OpenaiImage(Star):
             return input_tokens + output_tokens
 
         return None
+
+    @staticmethod
+    def _summarize_image_usage(
+        buckets: list[dict[str, Any]], days: int, start_time: int, end_time: int
+    ) -> ImageUsageSummary:
+        summary = ImageUsageSummary(
+            days=days,
+            start_time=start_time,
+            end_time=end_time,
+            by_api_key={},
+        )
+        for bucket in buckets:
+            results = bucket.get("results")
+            if not isinstance(results, list):
+                continue
+            for result in results:
+                if not isinstance(result, dict):
+                    continue
+                images = OpenaiImage._number_as_int(
+                    result.get("images")
+                ) or OpenaiImage._number_as_int(result.get("num_images"))
+                requests = OpenaiImage._number_as_int(
+                    result.get("num_model_requests")
+                ) or OpenaiImage._number_as_int(result.get("requests"))
+                api_key_id = result.get("api_key_id")
+                key_label = api_key_id if isinstance(api_key_id, str) and api_key_id else "未分组"
+
+                summary.images += images
+                summary.requests += requests
+                if summary.by_api_key is not None:
+                    key_usage = summary.by_api_key.setdefault(
+                        key_label, {"images": 0, "requests": 0}
+                    )
+                    key_usage["images"] += images
+                    key_usage["requests"] += requests
+        return summary
+
+    @staticmethod
+    def _summarize_costs(buckets: list[dict[str, Any]]) -> dict[str, float]:
+        totals: dict[str, float] = {}
+        for bucket in buckets:
+            results = bucket.get("results")
+            if not isinstance(results, list):
+                continue
+            for result in results:
+                if not isinstance(result, dict):
+                    continue
+                amount = result.get("amount")
+                if not isinstance(amount, dict):
+                    continue
+                currency = amount.get("currency")
+                value = amount.get("value")
+                if not isinstance(currency, str) or not currency:
+                    continue
+                value_float = OpenaiImage._number_as_float(value)
+                if value_float is None:
+                    continue
+                totals[currency.lower()] = (
+                    totals.get(currency.lower(), 0.0) + value_float
+                )
+        return totals
+
+    @staticmethod
+    def _format_usage_summary(
+        summary: ImageUsageSummary, elapsed_seconds: float | None
+    ) -> str:
+        start_date = datetime.fromtimestamp(summary.start_time).strftime("%Y-%m-%d")
+        end_date = datetime.fromtimestamp(summary.end_time).strftime("%Y-%m-%d")
+        lines = [
+            f"OpenAI 图片用量（最近 {summary.days} 天，{start_date} 至 {end_date}）",
+            f"图片数：{summary.images}",
+            f"模型请求数：{summary.requests}",
+        ]
+
+        if summary.costs_by_currency:
+            costs = ", ".join(
+                f"{currency.upper()} {value:.4f}"
+                for currency, value in sorted(summary.costs_by_currency.items())
+            )
+            lines.append(f"组织费用（同周期，所有 API 服务）：{costs}")
+
+        if summary.by_api_key:
+            non_empty_keys = [
+                (api_key_id, usage)
+                for api_key_id, usage in summary.by_api_key.items()
+                if usage["images"] or usage["requests"]
+            ]
+            if non_empty_keys:
+                lines.append("API Key 明细：")
+                for api_key_id, usage in sorted(
+                    non_empty_keys,
+                    key=lambda item: item[1]["images"],
+                    reverse=True,
+                )[:8]:
+                    lines.append(
+                        f"- {api_key_id}: 图片 {usage['images']}，请求 {usage['requests']}"
+                    )
+                if len(non_empty_keys) > 8:
+                    lines.append(f"- 其余 {len(non_empty_keys) - 8} 个 key 已省略")
+
+        if elapsed_seconds is not None:
+            lines.append(f"查询耗时：{elapsed_seconds:.1f} 秒")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _number_as_int(value: Any) -> int:
+        if isinstance(value, bool):
+            return 0
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+        return 0
+
+    @staticmethod
+    def _number_as_float(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _parse_usage_days(args: str) -> int:
+        match = re.search(r"\d+", args)
+        if not match:
+            return 7
+        days = int(match.group(0))
+        return min(max(days, 1), 180)
 
     @staticmethod
     def _build_done_message(

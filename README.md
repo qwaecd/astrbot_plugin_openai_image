@@ -7,6 +7,7 @@ AstrBot OpenAI 文生图插件。插件通过异步 HTTP 请求直接调用 Open
 在 AstrBot 插件配置页填写：
 
 - `api_key`: OpenAI API Key
+- `admin_api_key`: OpenAI Admin API Key，仅用于管理员查询用量/费用；普通生图不需要填写
 - `proxy`: 代理地址，可留空，例如 `http://127.0.0.1:7890`。也可填写 `127.0.0.1:7890`，插件会按 HTTP 代理处理；使用 TUN 模式时建议留空
 - `model`: 图像模型，默认 `gpt-image-1`
 - `size`: 图片尺寸，默认 `1024x1024`
@@ -32,5 +33,15 @@ AstrBot OpenAI 文生图插件。插件通过异步 HTTP 请求直接调用 Open
 /编辑图片 改成水彩插画风格
 /edit remove the text on the poster
 ```
+
+管理员可查询 OpenAI 图片用量：
+
+```text
+/图片用量
+/图片用量 30
+/openai_usage 7
+```
+
+该指令需要 AstrBot 管理员权限。`admin_api_key` 需要填写 OpenAI Organization Admin API Key，插件会调用 `/v1/organization/usage/images` 查询图片用量，并尽量调用 `/v1/organization/costs` 附带同周期组织费用汇总。费用接口返回的是组织同周期 API 总费用，不一定只包含图片接口。
 
 插件会优先发送 OpenAI 返回的 `b64_json` 图片；如果模型返回图片 URL，也会异步下载后转换为 AstrBot 可发送的 base64 图片消息。
