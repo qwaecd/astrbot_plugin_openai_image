@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import base64
+import binascii
+import mimetypes
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime
 from time import monotonic, time
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 import httpx
 
@@ -15,12 +19,12 @@ from astrbot.api.star import Context, Star
 from astrbot.core import AstrBotConfig
 from astrbot.core.message.components import Image
 from astrbot.core.star.filter.command import GreedyStr
-from astrbot.core.utils.media_utils import MediaResolver, describe_media_ref
 from astrbot.core.utils.network_utils import (
     create_proxy_client,
     is_connection_error,
     log_connection_failure,
 )
+from astrbot.core.utils.quoted_message.image_resolver import ImageResolver
 from astrbot.core.utils.quoted_message_parser import extract_quoted_message_images
 
 
@@ -40,6 +44,12 @@ class OpenAIUsageAPIError(Exception):
 class ImageAPIResult:
     base64_image: str
     total_tokens: int | None = None
+
+
+@dataclass(slots=True)
+class ImageRefData:
+    content: bytes
+    mime_type: str
 
 
 @dataclass(slots=True)
@@ -177,7 +187,7 @@ class OpenaiImage(Star):
                 self._get_str("quality", "auto"),
                 self._get_str("output_format", "png"),
                 len(prompt_text),
-                describe_media_ref(image_ref),
+                self._describe_media_ref(image_ref),
                 self._describe_proxy(),
             )
             await event.send(MessageChain().message("正在改图，请稍等..."))
@@ -301,16 +311,9 @@ class OpenaiImage(Star):
     ) -> ImageAPIResult:
         client = await self._ensure_client()
         timeout = self._get_int("timeout", 120)
-        image_data = await MediaResolver(
-            image_ref,
-            media_type="image",
-            default_suffix=".png",
-        ).to_base64_data(strict=True, default_mime_type="image/png")
-        if image_data is None:
-            raise OpenAIImageAPIError("无法读取要修改的图片。")
-
-        image_bytes = image_data.to_bytes()
-        image_mime_type = image_data.mime_type or "image/png"
+        image_data = await self._resolve_image_ref_data(client, image_ref, timeout)
+        image_bytes = image_data.content
+        image_mime_type = image_data.mime_type
         image_ext = self._extension_from_mime_type(image_mime_type)
         api_url = self._build_api_url("images/edits")
         form_data = self._build_edit_form(prompt)
@@ -467,7 +470,7 @@ class OpenaiImage(Star):
             total_tokens = self._extract_total_tokens(data)
             logger.info(
                 "[OpenAI Image] API 返回图片 URL: %s, total_tokens=%s",
-                describe_media_ref(image_url),
+                self._describe_media_ref(image_url),
                 total_tokens if total_tokens is not None else "unknown",
             )
             return ImageAPIResult(
@@ -485,7 +488,10 @@ class OpenaiImage(Star):
         url: str,
         timeout: int,
     ) -> str:
-        logger.info("[OpenAI Image] 正在下载 API 返回的图片 URL: %s", describe_media_ref(url))
+        logger.info(
+            "[OpenAI Image] 正在下载 API 返回的图片 URL: %s",
+            self._describe_media_ref(url),
+        )
         response = await client.get(url, timeout=timeout, follow_redirects=True)
         if response.status_code >= 400:
             raise OpenAIImageAPIError(f"下载生成图片失败，HTTP {response.status_code}。")
@@ -553,12 +559,134 @@ class OpenaiImage(Star):
             if isinstance(component, Image):
                 image_ref = component.url or component.file
                 if image_ref:
-                    return image_ref
+                    resolved = await self._resolve_image_refs_for_event(
+                        event, [image_ref]
+                    )
+                    return resolved[0] if resolved else image_ref
 
         quoted_images = await extract_quoted_message_images(event)
         if quoted_images:
             return quoted_images[0]
 
+        return None
+
+    async def _resolve_image_refs_for_event(
+        self, event: AstrMessageEvent, image_refs: list[str]
+    ) -> list[str]:
+        try:
+            return await ImageResolver(event).resolve_for_llm(image_refs)
+        except Exception as exc:
+            logger.warning("[OpenAI Image] AstrBot 图片引用解析失败，将使用原始引用: %s", exc)
+            return []
+
+    async def _resolve_image_ref_data(
+        self,
+        client: httpx.AsyncClient,
+        image_ref: str,
+        timeout: int,
+    ) -> ImageRefData:
+        value = str(image_ref or "").strip()
+        if not value:
+            raise OpenAIImageAPIError("无法读取要修改的图片。")
+
+        lower_value = value.lower()
+        if lower_value.startswith("base64://"):
+            content = self._decode_base64_image(value[len("base64://") :])
+            return ImageRefData(
+                content=content,
+                mime_type=self._guess_image_mime(content),
+            )
+
+        if lower_value.startswith("data:image/"):
+            return self._decode_data_url_image(value)
+
+        if lower_value.startswith(("http://", "https://")):
+            return await self._download_ref_image(client, value, timeout)
+
+        local_path = self._local_path_from_ref(value)
+        if local_path:
+            return await self._read_local_image(local_path)
+
+        raise OpenAIImageAPIError(
+            f"无法读取要修改的图片引用：{self._describe_media_ref(value)}"
+        )
+
+    async def _download_ref_image(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        timeout: int,
+    ) -> ImageRefData:
+        logger.info(
+            "[OpenAI Image] 正在下载改图输入图片: %s",
+            self._describe_media_ref(url),
+        )
+        response = await client.get(url, timeout=timeout, follow_redirects=True)
+        if response.status_code >= 400:
+            raise OpenAIImageAPIError(f"下载改图输入图片失败，HTTP {response.status_code}。")
+        content_type = response.headers.get("content-type", "").split(";", 1)[0].strip()
+        mime_type = content_type if content_type.startswith("image/") else ""
+        content = response.content
+        return ImageRefData(
+            content=content,
+            mime_type=mime_type or self._guess_image_mime(content),
+        )
+
+    @staticmethod
+    async def _read_local_image(path: str) -> ImageRefData:
+        try:
+            with open(path, "rb") as file:
+                content = file.read()
+        except OSError as exc:
+            raise OpenAIImageAPIError(f"读取本地图片失败：{exc}") from exc
+
+        guessed_type, _ = mimetypes.guess_type(path)
+        mime_type = (
+            guessed_type
+            if guessed_type and guessed_type.startswith("image/")
+            else ""
+        )
+        return ImageRefData(
+            content=content,
+            mime_type=mime_type or OpenaiImage._guess_image_mime(content),
+        )
+
+    @staticmethod
+    def _decode_data_url_image(value: str) -> ImageRefData:
+        comma_index = value.find(",")
+        if comma_index <= 0:
+            raise OpenAIImageAPIError("图片 data URL 格式异常。")
+        header = value[:comma_index]
+        payload = value[comma_index + 1 :]
+        header_parts = header.split(";")
+        mime_type = header_parts[0][len("data:") :].strip().lower()
+        if "base64" not in {part.lower() for part in header_parts[1:]}:
+            raise OpenAIImageAPIError("图片 data URL 不是 base64 编码。")
+        content = OpenaiImage._decode_base64_image(payload)
+        fallback_mime_type = OpenaiImage._guess_image_mime(content)
+        return ImageRefData(
+            content=content,
+            mime_type=mime_type if mime_type.startswith("image/") else fallback_mime_type,
+        )
+
+    @staticmethod
+    def _decode_base64_image(payload: str) -> bytes:
+        try:
+            return base64.b64decode(payload, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise OpenAIImageAPIError("图片 base64 数据格式异常。") from exc
+
+    @staticmethod
+    def _local_path_from_ref(value: str) -> str | None:
+        if value.lower().startswith("file://"):
+            split = urlsplit(value)
+            path = unquote(split.path)
+            if os.name == "nt" and re.match(r"^/[A-Za-z]:/", path):
+                path = path[1:]
+        else:
+            path = value
+        if path and os.path.exists(path):
+            return os.path.abspath(path)
         return None
 
     async def _ensure_client(self) -> httpx.AsyncClient:
@@ -927,6 +1055,29 @@ class OpenaiImage(Star):
         if not effective_proxy:
             return "direct/system-route"
         return effective_proxy
+
+    @staticmethod
+    def _guess_image_mime(content: bytes) -> str:
+        if content.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if content.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if content.startswith(b"RIFF") and content[8:12] == b"WEBP":
+            return "image/webp"
+        if content.startswith(b"GIF87a") or content.startswith(b"GIF89a"):
+            return "image/gif"
+        return "image/png"
+
+    @staticmethod
+    def _describe_media_ref(value: str) -> str:
+        ref = str(value or "").strip()
+        if not ref:
+            return "empty"
+        if ref.lower().startswith(("base64://", "data:image/")):
+            return f"{ref[:24]}...({len(ref)} chars)"
+        if len(ref) > 160:
+            return f"{ref[:120]}...({len(ref)} chars)"
+        return ref
 
     @staticmethod
     def _extension_from_mime_type(mime_type: str) -> str:
