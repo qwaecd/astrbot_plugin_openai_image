@@ -1,9 +1,4 @@
 {
-  "enabled": {
-    "description": "是否启用 OpenAI 生图插件",
-    "type": "bool",
-    "default": true
-  },
   "api_key": {
     "description": "OpenAI API Key",
     "type": "string",
@@ -15,10 +10,10 @@
     "description": "代理地址",
     "type": "string",
     "default": "",
-    "hint": "例如 http://127.0.0.1:7890；留空则不使用代理"
+    "hint": "例如 http://127.0.0.1:7890；也可填 127.0.0.1:7890，插件会按 HTTP 代理处理；使用 TUN 模式时建议留空"
   },
   "model": {
-    "description": "生图模型",
+    "description": "图像模型",
     "type": "string",
     "default": "gpt-image-1",
     "hint": "默认使用 OpenAI 图像生成模型 gpt-image-1"

@@ -7,8 +7,8 @@ AstrBot OpenAI 文生图插件。插件通过异步 HTTP 请求直接调用 Open
 在 AstrBot 插件配置页填写：
 
 - `api_key`: OpenAI API Key
-- `proxy`: 代理地址，可留空，例如 `http://127.0.0.1:7890`
-- `model`: 生图模型，默认 `gpt-image-1`
+- `proxy`: 代理地址，可留空，例如 `http://127.0.0.1:7890`。也可填写 `127.0.0.1:7890`，插件会按 HTTP 代理处理；使用 TUN 模式时建议留空
+- `model`: 图像模型，默认 `gpt-image-1`
 - `size`: 图片尺寸，默认 `1024x1024`
 - `quality`: 图片质量，默认 `auto`
 - `output_format`: `gpt-image` 系列模型的输出格式，默认 `png`
@@ -23,6 +23,14 @@ AstrBot OpenAI 文生图插件。插件通过异步 HTTP 请求直接调用 Open
 /生图 水彩风格的江南雨巷
 /image a tiny robot reading a book under warm light
 /draw cinematic mountain village at sunrise
+```
+
+改图时，在消息中附带一张图片，或引用一张图片后发送：
+
+```text
+/改图 把背景换成海边日落，保持人物不变
+/编辑图片 改成水彩插画风格
+/edit remove the text on the poster
 ```
 
 插件会优先发送 OpenAI 返回的 `b64_json` 图片；如果模型返回图片 URL，也会异步下载后转换为 AstrBot 可发送的 base64 图片消息。
