@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import binascii
 import json
@@ -29,6 +30,9 @@ from astrbot.core.utils.quoted_message_parser import extract_quoted_message_imag
 
 DEFAULT_API_BASE = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-image-1"
+DEFAULT_RESPONSES_MODEL = "gpt-5-mini"
+GENERATION_MODE_IMAGES_API = "images_api"
+GENERATION_MODE_RESPONSES_BACKGROUND = "responses_background"
 
 
 class OpenAIImageAPIError(Exception):
@@ -72,9 +76,12 @@ class OpenaiImage(Star):
     async def initialize(self):
         await self._ensure_client()
         logger.info(
-            "[OpenAI Image] 插件初始化完成: model=%s, api_base=%s, proxy=%s, "
+            "[OpenAI Image] 插件初始化完成: generation_mode=%s, model=%s, "
+            "responses_model=%s, api_base=%s, proxy=%s, "
             "whitelist_enabled=%s, whitelist_count=%d, whitelist_admin_bypass=%s",
+            self._get_generation_mode(),
             self._get_str("model", DEFAULT_MODEL),
+            self._get_str("responses_model", DEFAULT_RESPONSES_MODEL),
             self._get_str("api_base", DEFAULT_API_BASE),
             self._describe_proxy(),
             self._get_bool("whitelist_enabled", False),
@@ -107,9 +114,12 @@ class OpenaiImage(Star):
 
         try:
             logger.info(
-                "[OpenAI Image] 生图任务开始: model=%s, size=%s, quality=%s, "
-                "output_format=%s, prompt_chars=%d, proxy=%s",
+                "[OpenAI Image] 生图任务开始: generation_mode=%s, model=%s, "
+                "responses_model=%s, size=%s, quality=%s, output_format=%s, "
+                "prompt_chars=%d, proxy=%s",
+                self._get_generation_mode(),
                 self._get_str("model", DEFAULT_MODEL),
+                self._get_str("responses_model", DEFAULT_RESPONSES_MODEL),
                 self._get_str("size", "1024x1024"),
                 self._get_str("quality", "auto"),
                 self._get_str("output_format", "png"),
@@ -276,6 +286,10 @@ class OpenaiImage(Star):
         )
 
     async def _create_image(self, prompt: str, api_key: str) -> ImageAPIResult:
+        generation_mode = self._get_generation_mode()
+        if generation_mode == GENERATION_MODE_RESPONSES_BACKGROUND:
+            return await self._create_image_background(prompt, api_key)
+
         client = await self._ensure_client()
         payload = self._build_payload(prompt)
         api_url = self._build_api_url("images/generations")
@@ -332,6 +346,123 @@ class OpenaiImage(Star):
         )
 
         return await self._extract_image_from_response(response, client, timeout)
+
+    async def _create_image_background(
+        self, prompt: str, api_key: str
+    ) -> ImageAPIResult:
+        try:
+            from openai import (
+                APIConnectionError,
+                APIStatusError,
+                APITimeoutError,
+                AsyncOpenAI,
+                OpenAIError,
+            )
+        except ImportError as exc:
+            raise OpenAIImageAPIError(
+                "当前环境未安装 openai 包，请安装插件 requirements.txt 后重启 AstrBot。"
+            ) from exc
+
+        timeout = self._get_int("timeout", 120)
+        poll_interval = self._get_background_poll_interval()
+        poll_timeout = self._get_int("background_poll_timeout", max(timeout, 300))
+        response_model = self._get_str("responses_model", DEFAULT_RESPONSES_MODEL)
+        api_base = self._build_sdk_base_url()
+        http_client = create_proxy_client("OpenAI Image", self._get_proxy())
+        sdk_client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=api_base,
+            timeout=timeout,
+            max_retries=2,
+            http_client=http_client,
+        )
+
+        try:
+            tool = self._build_responses_image_generation_tool()
+            logger.info(
+                "[OpenAI Image] 提交后台生图任务: api_base=%s, responses_model=%s, "
+                "image_model=%s, timeout=%ss, poll_interval=%ss, poll_timeout=%ss, "
+                "proxy=%s",
+                api_base,
+                response_model,
+                tool.get("model", "default"),
+                timeout,
+                poll_interval,
+                poll_timeout,
+                self._describe_proxy(),
+            )
+            request_started_at = monotonic()
+            response = await sdk_client.responses.create(
+                model=response_model,
+                input=prompt,
+                instructions=(
+                    "Use the image_generation tool to generate exactly one image "
+                    "matching the user's prompt. Do not answer with text only."
+                ),
+                tools=[tool],
+                tool_choice={"type": "image_generation"},
+                background=True,
+                timeout=timeout,
+            )
+            response_data = self._openai_model_to_dict(response)
+            response_id = self._get_response_id(response_data, response)
+            status = self._get_response_status(response_data, response)
+            logger.info(
+                "[OpenAI Image] 后台生图任务已提交: response_id=%s, status=%s, "
+                "elapsed=%.2fs",
+                response_id or "unknown",
+                status or "unknown",
+                monotonic() - request_started_at,
+            )
+
+            if not response_id:
+                raise OpenAIImageAPIError("OpenAI 后台任务返回中没有 response id。")
+
+            poll_started_at = monotonic()
+            poll_count = 0
+            while status in {"queued", "in_progress", "pending"}:
+                if monotonic() - poll_started_at >= poll_timeout:
+                    raise OpenAIImageAPIError(
+                        f"OpenAI 后台生图任务超过 {poll_timeout} 秒仍未完成。"
+                    )
+
+                await asyncio.sleep(poll_interval)
+                poll_count += 1
+                poll_request_started_at = monotonic()
+                response = await sdk_client.responses.retrieve(
+                    response_id,
+                    timeout=timeout,
+                )
+                response_data = self._openai_model_to_dict(response)
+                status = self._get_response_status(response_data, response)
+                logger.info(
+                    "[OpenAI Image] 后台生图轮询: response_id=%s, poll=%d, "
+                    "status=%s, elapsed=%.2fs",
+                    response_id,
+                    poll_count,
+                    status or "unknown",
+                    monotonic() - poll_request_started_at,
+                )
+
+            if status != "completed":
+                message = self._extract_responses_failure_message(response_data)
+                raise OpenAIImageAPIError(
+                    f"OpenAI 后台生图任务未完成，状态：{status or 'unknown'}。{message}"
+                )
+
+            return await self._extract_image_from_responses_data(
+                response_data,
+                http_client,
+                timeout,
+            )
+        except APIStatusError as exc:
+            raise OpenAIImageAPIError(self._extract_openai_sdk_error_message(exc)) from exc
+        except (APIConnectionError, APITimeoutError):
+            raise
+        except OpenAIError as exc:
+            raise OpenAIImageAPIError(str(exc)) from exc
+        finally:
+            await sdk_client.close()
 
     async def _edit_image(
         self, prompt: str, image_ref: str, api_key: str
@@ -693,6 +824,44 @@ class OpenaiImage(Star):
 
         raise OpenAIImageAPIError("OpenAI 返回中没有 b64_json 或图片 URL。")
 
+    async def _extract_image_from_responses_data(
+        self,
+        data: dict[str, Any],
+        client: httpx.AsyncClient,
+        timeout: int,
+    ) -> ImageAPIResult:
+        total_tokens = self._extract_total_tokens(data)
+        image_b64 = self._find_responses_image_base64(data)
+        if image_b64:
+            logger.info(
+                "[OpenAI Image] Responses API 返回 base64 图片: payload_chars=%d, "
+                "total_tokens=%s",
+                len(image_b64),
+                total_tokens if total_tokens is not None else "unknown",
+            )
+            return ImageAPIResult(
+                base64_image=image_b64,
+                total_tokens=total_tokens,
+            )
+
+        image_url = self._find_responses_image_url(data)
+        if image_url:
+            logger.info(
+                "[OpenAI Image] Responses API 返回图片 URL: %s, total_tokens=%s",
+                self._describe_media_ref(image_url),
+                total_tokens if total_tokens is not None else "unknown",
+            )
+            return ImageAPIResult(
+                base64_image=await self._download_image_as_base64(
+                    client, image_url, timeout
+                ),
+                total_tokens=total_tokens,
+            )
+
+        raise OpenAIImageAPIError(
+            "OpenAI Responses API 返回中没有 image_generation_call.result 图片。"
+        )
+
     async def _download_image_as_base64(
         self,
         client: httpx.AsyncClient,
@@ -738,6 +907,33 @@ class OpenaiImage(Star):
             payload["response_format"] = "b64_json"
 
         return payload
+
+    def _build_responses_image_generation_tool(self) -> dict[str, Any]:
+        model = self._get_str("model", DEFAULT_MODEL)
+        tool: dict[str, Any] = {
+            "type": "image_generation",
+            "action": "generate",
+            "model": model,
+        }
+
+        size = self._get_str("size", "1024x1024")
+        if size:
+            tool["size"] = size
+
+        quality = self._get_str("quality", "auto")
+        if quality in {"auto", "low", "medium", "high"}:
+            tool["quality"] = quality
+        elif quality:
+            logger.warning(
+                "[OpenAI Image] Responses image_generation 不支持 quality=%s，已忽略。",
+                quality,
+            )
+
+        output_format = self._get_str("output_format", "png")
+        if output_format in {"png", "jpeg", "webp"}:
+            tool["output_format"] = output_format
+
+        return tool
 
     def _build_edit_form(self, prompt: str) -> dict[str, str]:
         model = self._get_str("model", DEFAULT_MODEL)
@@ -919,20 +1115,25 @@ class OpenaiImage(Star):
             self._client_proxy = ""
 
     def _build_api_url(self, endpoint: str) -> str:
+        api_base = self._build_sdk_base_url()
+        endpoint = endpoint.strip("/")
+        if api_base.endswith(f"/{endpoint}"):
+            return api_base
+        return f"{api_base}/{endpoint}"
+
+    def _build_sdk_base_url(self) -> str:
         api_base = self._get_str("api_base", DEFAULT_API_BASE).rstrip("/")
         if not api_base:
             api_base = DEFAULT_API_BASE
-        endpoint = endpoint.strip("/")
-        for known_endpoint in ("images/generations", "images/edits"):
+
+        for known_endpoint in ("images/generations", "images/edits", "responses"):
             suffix = f"/{known_endpoint}"
             if api_base.endswith(suffix):
                 api_base = api_base[: -len(suffix)]
                 break
-        if api_base.endswith(f"/{endpoint}"):
-            return api_base
         if not re.search(r"/v\d+$", api_base):
             api_base = f"{api_base}/v1"
-        return f"{api_base}/{endpoint}"
+        return api_base
 
     @staticmethod
     def _parse_json_response(response: httpx.Response) -> dict[str, Any]:
@@ -1010,6 +1211,127 @@ class OpenaiImage(Star):
             return True
         images = event_data.get("data")
         return isinstance(images, list) and bool(images)
+
+    @staticmethod
+    def _openai_model_to_dict(value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+
+        model_dump = getattr(value, "model_dump", None)
+        if callable(model_dump):
+            data = model_dump(mode="json")
+            if isinstance(data, dict):
+                return data
+
+        to_dict = getattr(value, "to_dict", None)
+        if callable(to_dict):
+            data = to_dict()
+            if isinstance(data, dict):
+                return data
+
+        return {}
+
+    @staticmethod
+    def _get_response_id(data: dict[str, Any], response: Any) -> str:
+        response_id = data.get("id") or getattr(response, "id", "")
+        return response_id if isinstance(response_id, str) else ""
+
+    @staticmethod
+    def _get_response_status(data: dict[str, Any], response: Any) -> str:
+        status = data.get("status") or getattr(response, "status", "")
+        return status if isinstance(status, str) else ""
+
+    @staticmethod
+    def _extract_responses_failure_message(data: dict[str, Any]) -> str:
+        for key in ("error", "incomplete_details"):
+            details = data.get(key)
+            if isinstance(details, dict):
+                message = details.get("message") or details.get("reason")
+                if isinstance(message, str) and message:
+                    return message
+            if isinstance(details, str) and details:
+                return details
+        return ""
+
+    @staticmethod
+    def _find_responses_image_base64(data: dict[str, Any]) -> str:
+        output = data.get("output")
+        if isinstance(output, list):
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") != "image_generation_call":
+                    continue
+                result = item.get("result")
+                if isinstance(result, str) and result.strip():
+                    return result.strip()
+
+        for item in OpenaiImage._walk_dicts(data):
+            if item.get("type") == "image_generation_call":
+                result = item.get("result")
+                if isinstance(result, str) and result.strip():
+                    return result.strip()
+
+        for item in OpenaiImage._walk_dicts(data):
+            b64_json = item.get("b64_json")
+            if isinstance(b64_json, str) and b64_json.strip():
+                return b64_json.strip()
+
+        return ""
+
+    @staticmethod
+    def _find_responses_image_url(data: dict[str, Any]) -> str:
+        for item in OpenaiImage._walk_dicts(data):
+            if item.get("type") == "image_generation_call":
+                url = item.get("url")
+                if isinstance(url, str) and url:
+                    return url
+
+        for item in OpenaiImage._walk_dicts(data):
+            url = item.get("url")
+            if isinstance(url, str) and url.startswith(("http://", "https://")):
+                return url
+
+        return ""
+
+    @staticmethod
+    def _walk_dicts(value: Any):
+        if isinstance(value, dict):
+            yield value
+            for child in value.values():
+                yield from OpenaiImage._walk_dicts(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from OpenaiImage._walk_dicts(child)
+
+    @staticmethod
+    def _extract_openai_sdk_error_message(exc: Exception) -> str:
+        response = getattr(exc, "response", None)
+        status_code = getattr(exc, "status_code", None)
+        if response is not None:
+            try:
+                data = response.json()
+            except ValueError:
+                data = None
+            if isinstance(data, dict):
+                error = data.get("error")
+                if isinstance(error, dict):
+                    message = error.get("message")
+                    if isinstance(message, str) and message:
+                        if status_code:
+                            return f"OpenAI API 返回 HTTP {status_code}：{message}"
+                        return message
+
+            text = getattr(response, "text", "")
+            if isinstance(text, str) and text.strip():
+                if status_code:
+                    return f"OpenAI API 返回 HTTP {status_code}：{text.strip()[:500]}"
+                return text.strip()[:500]
+
+        message = getattr(exc, "message", "") or str(exc)
+        if status_code:
+            return f"OpenAI API 返回 HTTP {status_code}：{message}"
+        return message
 
     @staticmethod
     def _extract_total_tokens(data: dict[str, Any]) -> int | None:
@@ -1243,6 +1565,21 @@ class OpenaiImage(Star):
                 default,
             )
             return default
+
+    def _get_generation_mode(self) -> str:
+        value = self._get_str("generation_mode", GENERATION_MODE_RESPONSES_BACKGROUND)
+        if value in {GENERATION_MODE_IMAGES_API, GENERATION_MODE_RESPONSES_BACKGROUND}:
+            return value
+        logger.warning(
+            "Invalid generation_mode=%r, using default %s.",
+            value,
+            GENERATION_MODE_RESPONSES_BACKGROUND,
+        )
+        return GENERATION_MODE_RESPONSES_BACKGROUND
+
+    def _get_background_poll_interval(self) -> int:
+        interval = self._get_int("background_poll_interval", 5)
+        return min(max(interval, 1), 60)
 
     def _should_stream_images(self) -> bool:
         model = self._get_str("model", DEFAULT_MODEL).lower()

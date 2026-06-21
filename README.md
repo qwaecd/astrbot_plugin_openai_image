@@ -1,6 +1,6 @@
 # astrbot_plugin_openai_image
 
-AstrBot OpenAI 文生图插件。插件通过异步 HTTP 请求直接调用 OpenAI Images API，不使用 OpenAI SDK，也不使用 `requests`。
+AstrBot OpenAI 文生图插件。插件使用异步网络请求调用 OpenAI；文生图可使用 OpenAI SDK + Responses 后台任务轮询，改图仍使用异步 HTTP 直接调用 Images API，不使用 `requests`。
 
 ## 配置
 
@@ -13,18 +13,24 @@ AstrBot OpenAI 文生图插件。插件通过异步 HTTP 请求直接调用 Open
 - `whitelist_admin_bypass`: AstrBot 管理员是否无视本插件白名单，默认开启
 - `proxy`: 代理地址，可留空，例如 `http://127.0.0.1:7890`。也可填写 `127.0.0.1:7890`，插件会按 HTTP 代理处理；使用 TUN 模式时建议留空
 - `model`: 图像模型，默认 `gpt-image-1`
+- `generation_mode`: 文生图调用方式，默认 `responses_background`。可改为 `images_api` 使用原 Images API 流式/非流式请求
+- `responses_model`: Responses 调度模型，默认 `gpt-5-mini`，仅在 `responses_background` 文生图模式下使用；实际图像模型仍由 `model` 决定
 - `size`: 图片尺寸，默认 `1024x1024`
 - `quality`: 图片质量，默认 `auto`
 - `output_format`: `gpt-image` 系列模型的输出格式，默认 `png`
 - `stream_enabled`: 是否启用流式生图，默认开启，仅对 `gpt-image` 系列模型生效
 - `partial_images`: 流式中间图数量，默认 `1`，取值 `0-3`
+- `background_poll_interval`: 后台生图轮询间隔，默认 5 秒，仅在 `responses_background` 文生图模式下使用
+- `background_poll_timeout`: 后台生图最长等待时间，默认 300 秒，仅在 `responses_background` 文生图模式下使用
 - `timeout`: 请求超时时间，默认 120 秒
 
 `api_base` 默认是 `https://api.openai.com/v1`，一般无需修改。
 
 当 `whitelist_enabled` 开启且 `whitelist_users` 不为空时，插件会在生图、改图和图片用量查询前检查白名单；未通过时不会请求 OpenAI。`whitelist_users` 为空时不启用白名单限制。
 
-流式模式下插件只发送最终图片，`partial_images` 产生的中间图仅用于让 OpenAI 更早返回流式事件，降低代理/网关因长时间无响应断开连接的概率。每张中间图会额外消耗约 100 image output tokens。
+`responses_background` 模式会先提交 OpenAI Responses 后台任务，再用短请求轮询任务状态，避免代理或网关在长时间空闲的单条连接上断开。该模式目前只用于 `/画图`，`/改图` 仍走 Images API。
+
+`images_api` 的流式模式下插件只发送最终图片，`partial_images` 产生的中间图仅用于让 OpenAI 更早返回流式事件，降低代理/网关因长时间无响应断开连接的概率。每张中间图会额外消耗约 100 image output tokens。
 
 ## 使用
 
