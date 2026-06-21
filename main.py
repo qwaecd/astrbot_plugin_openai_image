@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import mimetypes
 import os
 import re
@@ -281,14 +282,42 @@ class OpenaiImage(Star):
         payload = self._build_payload(prompt)
         api_url = self._build_api_url("images/generations")
         timeout = self._get_int("timeout", 120)
+        stream_enabled = self._should_stream_images()
 
         logger.info(
-            "[OpenAI Image] 发送生图请求: url=%s, timeout=%ss, proxy=%s",
+            "[OpenAI Image] 发送生图请求: url=%s, timeout=%ss, proxy=%s, stream=%s",
             api_url,
             timeout,
             self._describe_proxy(),
+            stream_enabled,
         )
         request_started_at = monotonic()
+        if stream_enabled:
+            payload["stream"] = True
+            payload["partial_images"] = self._get_partial_images()
+            async with client.stream(
+                "POST",
+                api_url,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=timeout,
+            ) as response:
+                logger.info(
+                    "[OpenAI Image] 生图流式请求已连接: status=%s, elapsed=%.2fs",
+                    response.status_code,
+                    monotonic() - request_started_at,
+                )
+                return await self._extract_image_from_stream(
+                    response,
+                    client,
+                    timeout,
+                    completed_events={"image_generation.completed"},
+                    partial_events={"image_generation.partial_image"},
+                )
+
         response = await client.post(
             api_url,
             headers={
@@ -317,6 +346,7 @@ class OpenaiImage(Star):
         image_ext = self._extension_from_mime_type(image_mime_type)
         api_url = self._build_api_url("images/edits")
         form_data = self._build_edit_form(prompt)
+        stream_enabled = self._should_stream_images()
 
         logger.info(
             "[OpenAI Image] 已解析改图输入图片: mime=%s, bytes=%d",
@@ -324,22 +354,48 @@ class OpenaiImage(Star):
             len(image_bytes),
         )
         logger.info(
-            "[OpenAI Image] 发送改图请求: url=%s, timeout=%ss, proxy=%s",
+            "[OpenAI Image] 发送改图请求: url=%s, timeout=%ss, proxy=%s, stream=%s",
             api_url,
             timeout,
             self._describe_proxy(),
+            stream_enabled,
         )
         request_started_at = monotonic()
+        files = [
+            (
+                "image[]",
+                (f"image{image_ext}", image_bytes, image_mime_type),
+            )
+        ]
+        if stream_enabled:
+            form_data["stream"] = "true"
+            form_data["partial_images"] = str(self._get_partial_images())
+            async with client.stream(
+                "POST",
+                api_url,
+                headers={"Authorization": f"Bearer {api_key}"},
+                data=form_data,
+                files=files,
+                timeout=timeout,
+            ) as response:
+                logger.info(
+                    "[OpenAI Image] 改图流式请求已连接: status=%s, elapsed=%.2fs",
+                    response.status_code,
+                    monotonic() - request_started_at,
+                )
+                return await self._extract_image_from_stream(
+                    response,
+                    client,
+                    timeout,
+                    completed_events={"image_edit.completed"},
+                    partial_events={"image_edit.partial_image"},
+                )
+
         response = await client.post(
             api_url,
             headers={"Authorization": f"Bearer {api_key}"},
             data=form_data,
-            files=[
-                (
-                    "image[]",
-                    (f"image{image_ext}", image_bytes, image_mime_type),
-                )
-            ],
+            files=files,
             timeout=timeout,
         )
         logger.info(
@@ -443,6 +499,163 @@ class OpenaiImage(Star):
         data = self._parse_json_response(response)
         if response.status_code >= 400:
             raise OpenAIImageAPIError(self._extract_error_message(data, response))
+
+        return await self._extract_image_from_data(data, client, timeout)
+
+    async def _extract_image_from_stream(
+        self,
+        response: httpx.Response,
+        client: httpx.AsyncClient,
+        timeout: int,
+        completed_events: set[str],
+        partial_events: set[str],
+    ) -> ImageAPIResult:
+        if response.status_code >= 400:
+            body = await response.aread()
+            raise OpenAIImageAPIError(
+                self._extract_stream_error_message(body, response.status_code)
+            )
+
+        current_event = ""
+        data_lines: list[str] = []
+        partial_count = 0
+        last_event_type = ""
+
+        async for raw_line in response.aiter_lines():
+            line = raw_line.strip()
+            if not line:
+                result, event_type, is_partial = await self._handle_stream_event(
+                    current_event,
+                    data_lines,
+                    client,
+                    timeout,
+                    completed_events,
+                    partial_events,
+                )
+                if result is not None:
+                    return result
+                if event_type:
+                    last_event_type = event_type
+                if is_partial:
+                    partial_count += 1
+                    logger.info(
+                        "[OpenAI Image] 收到流式中间图片: count=%d, event=%s",
+                        partial_count,
+                        event_type or current_event or "unknown",
+                    )
+                current_event = ""
+                data_lines = []
+                continue
+
+            if line.startswith(":"):
+                continue
+            if line.startswith("event:"):
+                current_event = line[len("event:") :].strip()
+                continue
+            if line.startswith("data:"):
+                data_lines.append(line[len("data:") :].strip())
+
+        result, event_type, is_partial = await self._handle_stream_event(
+            current_event,
+            data_lines,
+            client,
+            timeout,
+            completed_events,
+            partial_events,
+        )
+        if result is not None:
+            return result
+        if is_partial:
+            partial_count += 1
+
+        raise OpenAIImageAPIError(
+            f"OpenAI 流式响应结束但没有最终图片。最后事件：{event_type or last_event_type or 'unknown'}。"
+        )
+
+    async def _handle_stream_event(
+        self,
+        current_event: str,
+        data_lines: list[str],
+        client: httpx.AsyncClient,
+        timeout: int,
+        completed_events: set[str],
+        partial_events: set[str],
+    ) -> tuple[ImageAPIResult | None, str, bool]:
+        if not data_lines:
+            return None, current_event, False
+
+        raw_data = "\n".join(data_lines).strip()
+        if not raw_data or raw_data == "[DONE]":
+            return None, current_event, False
+
+        try:
+            event_data = json.loads(raw_data)
+        except json.JSONDecodeError as exc:
+            raise OpenAIImageAPIError("OpenAI 流式响应包含无法解析的 JSON。") from exc
+        if not isinstance(event_data, dict):
+            return None, current_event, False
+
+        error = event_data.get("error")
+        if isinstance(error, dict):
+            message = error.get("message")
+            raise OpenAIImageAPIError(
+                message if isinstance(message, str) and message else "OpenAI 流式响应返回错误。"
+            )
+
+        event_type = self._extract_stream_event_type(current_event, event_data)
+        if event_type in partial_events or event_type.endswith(".partial_image"):
+            return None, event_type, True
+
+        if (
+            event_type in completed_events
+            or event_type.endswith(".completed")
+            or (not event_type and self._event_data_has_image(event_data))
+        ):
+            return (
+                await self._extract_image_from_data(event_data, client, timeout),
+                event_type,
+                False,
+            )
+
+        return None, event_type, False
+
+    async def _extract_image_from_data(
+        self,
+        data: dict[str, Any],
+        client: httpx.AsyncClient,
+        timeout: int,
+    ) -> ImageAPIResult:
+        top_level_b64 = data.get("b64_json")
+        if isinstance(top_level_b64, str) and top_level_b64.strip():
+            total_tokens = self._extract_total_tokens(data)
+            logger.info(
+                "[OpenAI Image] API 返回 base64 图片: payload_chars=%d, total_tokens=%s",
+                len(top_level_b64),
+                total_tokens if total_tokens is not None else "unknown",
+            )
+            return ImageAPIResult(
+                base64_image=top_level_b64.strip(),
+                total_tokens=total_tokens,
+            )
+
+        top_level_url = data.get("url")
+        if isinstance(top_level_url, str) and top_level_url:
+            total_tokens = self._extract_total_tokens(data)
+            logger.info(
+                "[OpenAI Image] API 返回图片 URL: %s, total_tokens=%s",
+                self._describe_media_ref(top_level_url),
+                total_tokens if total_tokens is not None else "unknown",
+            )
+            return ImageAPIResult(
+                base64_image=await self._download_image_as_base64(
+                    client, top_level_url, timeout
+                ),
+                total_tokens=total_tokens,
+            )
+
+        image = data.get("image")
+        if isinstance(image, dict):
+            return await self._extract_image_from_data(image, client, timeout)
 
         images = data.get("data")
         if not isinstance(images, list) or not images:
@@ -752,6 +965,24 @@ class OpenaiImage(Star):
         return data
 
     @staticmethod
+    def _extract_stream_error_message(body: bytes, status_code: int) -> str:
+        try:
+            data = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            text = body.decode("utf-8", errors="replace").strip()
+            if text:
+                return f"OpenAI API 返回 HTTP {status_code}：{text[:500]}"
+            return f"OpenAI API 返回 HTTP {status_code}。"
+
+        if isinstance(data, dict):
+            error = data.get("error")
+            if isinstance(error, dict):
+                message = error.get("message")
+                if isinstance(message, str) and message:
+                    return message
+        return f"OpenAI API 返回 HTTP {status_code}。"
+
+    @staticmethod
     def _extract_error_message(data: dict[str, Any], response: httpx.Response) -> str:
         error = data.get("error")
         if isinstance(error, dict):
@@ -759,6 +990,28 @@ class OpenaiImage(Star):
             if isinstance(message, str) and message:
                 return message
         return f"OpenAI API 返回 HTTP {response.status_code}。"
+
+    @staticmethod
+    def _extract_stream_event_type(
+        current_event: str,
+        event_data: dict[str, Any],
+    ) -> str:
+        for key in ("type", "event"):
+            value = event_data.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return current_event
+
+    @staticmethod
+    def _event_data_has_image(event_data: dict[str, Any]) -> bool:
+        if isinstance(event_data.get("b64_json"), str):
+            return True
+        if isinstance(event_data.get("url"), str):
+            return True
+        if isinstance(event_data.get("image"), dict):
+            return True
+        images = event_data.get("data")
+        return isinstance(images, list) and bool(images)
 
     @staticmethod
     def _extract_total_tokens(data: dict[str, Any]) -> int | None:
@@ -992,6 +1245,16 @@ class OpenaiImage(Star):
                 default,
             )
             return default
+
+    def _should_stream_images(self) -> bool:
+        model = self._get_str("model", DEFAULT_MODEL).lower()
+        if not model.startswith("gpt-image"):
+            return False
+        return self._get_bool("stream_enabled", True)
+
+    def _get_partial_images(self) -> int:
+        partial_images = self._get_int("partial_images", 1)
+        return min(max(partial_images, 0), 3)
 
     def _get_bool(self, key: str, default: bool = False) -> bool:
         value = self.config.get(key, default)

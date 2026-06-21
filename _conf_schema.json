@@ -91,6 +91,18 @@
     ],
     "hint": "仅对 gpt-image 系列模型传递"
   },
+  "stream_enabled": {
+    "description": "启用流式生图",
+    "type": "bool",
+    "default": true,
+    "hint": "仅对 gpt-image 系列模型启用；可减少长时间无响应导致的代理/网关断开"
+  },
+  "partial_images": {
+    "description": "流式中间图数量",
+    "type": "int",
+    "default": 1,
+    "hint": "取值 0-3；插件只发送最终图，中间图仅用于保持流式响应。每张中间图会额外消耗约 100 image output tokens"
+  },
   "timeout": {
     "description": "请求超时时间（秒）",
     "type": "int",

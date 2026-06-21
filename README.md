@@ -16,11 +16,15 @@ AstrBot OpenAI 文生图插件。插件通过异步 HTTP 请求直接调用 Open
 - `size`: 图片尺寸，默认 `1024x1024`
 - `quality`: 图片质量，默认 `auto`
 - `output_format`: `gpt-image` 系列模型的输出格式，默认 `png`
+- `stream_enabled`: 是否启用流式生图，默认开启，仅对 `gpt-image` 系列模型生效
+- `partial_images`: 流式中间图数量，默认 `1`，取值 `0-3`
 - `timeout`: 请求超时时间，默认 120 秒
 
 `api_base` 默认是 `https://api.openai.com/v1`，一般无需修改。
 
 当 `whitelist_enabled` 开启且 `whitelist_users` 不为空时，插件会在生图、改图和图片用量查询前检查白名单；未通过时不会请求 OpenAI。`whitelist_users` 为空时不启用白名单限制。
+
+流式模式下插件只发送最终图片，`partial_images` 产生的中间图仅用于让 OpenAI 更早返回流式事件，降低代理/网关因长时间无响应断开连接的概率。每张中间图会额外消耗约 100 image output tokens。
 
 ## 使用
 

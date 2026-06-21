@@ -208,3 +208,7 @@ __marimo__/
 
 # ide
 .idea
+
+# tmp
+.data
+.agents
