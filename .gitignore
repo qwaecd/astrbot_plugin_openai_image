@@ -210,5 +210,5 @@ __marimo__/
 .idea
 
 # tmp
-.data
-.agents
+/data
+/agents
