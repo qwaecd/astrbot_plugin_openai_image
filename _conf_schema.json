@@ -47,7 +47,7 @@
     "hint": "默认使用 OpenAI 图像生成模型 gpt-image-1"
   },
   "generation_mode": {
-    "description": "文生图调用方式",
+    "description": "图像调用方式",
     "type": "string",
     "default": "responses_background",
     "enum": [
@@ -60,7 +60,7 @@
     "description": "Responses 调度模型",
     "type": "string",
     "default": "gpt-5-mini",
-    "hint": "仅在 responses_background 文生图模式下使用；图像实际生成模型仍由“图像模型”配置决定"
+    "hint": "仅在 responses_background 图像模式下使用；图像实际生成模型仍由“图像模型”配置决定"
   },
   "api_base": {
     "description": "OpenAI API Base",
@@ -123,13 +123,13 @@
     "description": "后台生图轮询间隔（秒）",
     "type": "int",
     "default": 5,
-    "hint": "仅在 responses_background 文生图模式下使用；取值会限制在 1-60 秒"
+    "hint": "仅在 responses_background 图像模式下使用；取值会限制在 1-60 秒"
   },
   "background_poll_timeout": {
     "description": "后台生图最长等待时间（秒）",
     "type": "int",
     "default": 300,
-    "hint": "仅在 responses_background 文生图模式下使用；超过该时间仍未完成会报错"
+    "hint": "仅在 responses_background 图像模式下使用；超过该时间仍未完成会报错"
   },
   "timeout": {
     "description": "请求超时时间（秒）",

@@ -350,6 +350,32 @@ class OpenaiImage(Star):
     async def _create_image_background(
         self, prompt: str, api_key: str
     ) -> ImageAPIResult:
+        return await self._run_responses_image_task(
+            prompt=prompt,
+            api_key=api_key,
+            action="generate",
+            action_label="生图",
+        )
+
+    async def _edit_image_background(
+        self, prompt: str, image_data: ImageRefData, api_key: str
+    ) -> ImageAPIResult:
+        return await self._run_responses_image_task(
+            prompt=prompt,
+            api_key=api_key,
+            action="edit",
+            action_label="改图",
+            image_data=image_data,
+        )
+
+    async def _run_responses_image_task(
+        self,
+        prompt: str,
+        api_key: str,
+        action: str,
+        action_label: str,
+        image_data: ImageRefData | None = None,
+    ) -> ImageAPIResult:
         try:
             from openai import (
                 APIConnectionError,
@@ -378,14 +404,17 @@ class OpenaiImage(Star):
         )
 
         try:
-            tool = self._build_responses_image_generation_tool()
+            tool = self._build_responses_image_generation_tool(action)
+            response_input = self._build_responses_image_input(prompt, image_data)
             logger.info(
-                "[OpenAI Image] 提交后台生图任务: api_base=%s, responses_model=%s, "
-                "image_model=%s, timeout=%ss, poll_interval=%ss, poll_timeout=%ss, "
-                "proxy=%s",
+                "[OpenAI Image] 提交后台%s任务: api_base=%s, responses_model=%s, "
+                "image_model=%s, input_image=%s, timeout=%ss, poll_interval=%ss, "
+                "poll_timeout=%ss, proxy=%s",
+                action_label,
                 api_base,
                 response_model,
                 tool.get("model", "default"),
+                "yes" if image_data is not None else "no",
                 timeout,
                 poll_interval,
                 poll_timeout,
@@ -394,11 +423,8 @@ class OpenaiImage(Star):
             request_started_at = monotonic()
             response = await sdk_client.responses.create(
                 model=response_model,
-                input=prompt,
-                instructions=(
-                    "Use the image_generation tool to generate exactly one image "
-                    "matching the user's prompt. Do not answer with text only."
-                ),
+                input=response_input,
+                instructions=self._build_responses_image_instructions(action),
                 tools=[tool],
                 tool_choice={"type": "image_generation"},
                 background=True,
@@ -408,8 +434,9 @@ class OpenaiImage(Star):
             response_id = self._get_response_id(response_data, response)
             status = self._get_response_status(response_data, response)
             logger.info(
-                "[OpenAI Image] 后台生图任务已提交: response_id=%s, status=%s, "
+                "[OpenAI Image] 后台%s任务已提交: response_id=%s, status=%s, "
                 "elapsed=%.2fs",
+                action_label,
                 response_id or "unknown",
                 status or "unknown",
                 monotonic() - request_started_at,
@@ -423,7 +450,7 @@ class OpenaiImage(Star):
             while status in {"queued", "in_progress", "pending"}:
                 if monotonic() - poll_started_at >= poll_timeout:
                     raise OpenAIImageAPIError(
-                        f"OpenAI 后台生图任务超过 {poll_timeout} 秒仍未完成。"
+                        f"OpenAI 后台{action_label}任务超过 {poll_timeout} 秒仍未完成。"
                     )
 
                 await asyncio.sleep(poll_interval)
@@ -436,8 +463,9 @@ class OpenaiImage(Star):
                 response_data = self._openai_model_to_dict(response)
                 status = self._get_response_status(response_data, response)
                 logger.info(
-                    "[OpenAI Image] 后台生图轮询: response_id=%s, poll=%d, "
+                    "[OpenAI Image] 后台%s轮询: response_id=%s, poll=%d, "
                     "status=%s, elapsed=%.2fs",
+                    action_label,
                     response_id,
                     poll_count,
                     status or "unknown",
@@ -447,7 +475,7 @@ class OpenaiImage(Star):
             if status != "completed":
                 message = self._extract_responses_failure_message(response_data)
                 raise OpenAIImageAPIError(
-                    f"OpenAI 后台生图任务未完成，状态：{status or 'unknown'}。{message}"
+                    f"OpenAI 后台{action_label}任务未完成，状态：{status or 'unknown'}。{message}"
                 )
 
             return await self._extract_image_from_responses_data(
@@ -472,6 +500,14 @@ class OpenaiImage(Star):
         image_data = await self._resolve_image_ref_data(client, image_ref, timeout)
         image_bytes = image_data.content
         image_mime_type = image_data.mime_type
+        if self._get_generation_mode() == GENERATION_MODE_RESPONSES_BACKGROUND:
+            logger.info(
+                "[OpenAI Image] 使用 Responses 后台改图: image_mime=%s, image_bytes=%d",
+                image_mime_type,
+                len(image_bytes),
+            )
+            return await self._edit_image_background(prompt, image_data, api_key)
+
         image_ext = self._extension_from_mime_type(image_mime_type)
         api_url = self._build_api_url("images/edits")
         form_data = self._build_edit_form(prompt)
@@ -908,11 +944,11 @@ class OpenaiImage(Star):
 
         return payload
 
-    def _build_responses_image_generation_tool(self) -> dict[str, Any]:
+    def _build_responses_image_generation_tool(self, action: str) -> dict[str, Any]:
         model = self._get_str("model", DEFAULT_MODEL)
         tool: dict[str, Any] = {
             "type": "image_generation",
-            "action": "generate",
+            "action": action,
             "model": model,
         }
 
@@ -934,6 +970,52 @@ class OpenaiImage(Star):
             tool["output_format"] = output_format
 
         return tool
+
+    def _build_responses_image_input(
+        self,
+        prompt: str,
+        image_data: ImageRefData | None,
+    ) -> str | list[dict[str, Any]]:
+        if image_data is None:
+            return prompt
+
+        image_url = self._image_data_to_data_url(image_data)
+        return [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": prompt,
+                    },
+                    {
+                        "type": "input_image",
+                        "image_url": image_url,
+                    },
+                ],
+            }
+        ]
+
+    @staticmethod
+    def _build_responses_image_instructions(action: str) -> str:
+        if action == "edit":
+            return (
+                "Use the image_generation tool to edit the provided input image "
+                "according to the user's prompt. Generate exactly one final image. "
+                "Do not answer with text only."
+            )
+        return (
+            "Use the image_generation tool to generate exactly one image "
+            "matching the user's prompt. Do not answer with text only."
+        )
+
+    @staticmethod
+    def _image_data_to_data_url(image_data: ImageRefData) -> str:
+        mime_type = image_data.mime_type or OpenaiImage._guess_image_mime(
+            image_data.content
+        )
+        encoded = base64.b64encode(image_data.content).decode("ascii")
+        return f"data:{mime_type};base64,{encoded}"
 
     def _build_edit_form(self, prompt: str) -> dict[str, str]:
         model = self._get_str("model", DEFAULT_MODEL)

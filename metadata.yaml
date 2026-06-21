@@ -1,7 +1,7 @@
 name: astrbot_plugin_openai_image
 display_name: OpenAI Image Generator
 desc: 使用 OpenAI Images API 进行文生图的 AstrBot 插件
-version: v1.1.1
+version: v1.2.0
 author: qwaecd
 repo: https://github.com/qwaecd/astrbot_plugin_openai_image
 astrbot_version: ">=4.16,<5"
