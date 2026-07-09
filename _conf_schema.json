@@ -119,6 +119,12 @@
     "default": 1,
     "hint": "取值 0-3；插件只发送最终图，中间图仅用于保持流式响应。每张中间图会额外消耗约 100 image output tokens"
   },
+  "max_reference_images": {
+    "description": "改图最大参考图片数",
+    "type": "int",
+    "default": 4,
+    "hint": "取值 1-16；改图时附带/引用的图片超过该数量，多余的图片会被直接丢弃"
+  },
   "background_poll_interval": {
     "description": "后台生图轮询间隔（秒）",
     "type": "int",

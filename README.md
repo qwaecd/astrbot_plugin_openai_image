@@ -20,6 +20,7 @@ AstrBot OpenAI 文生图插件。插件使用异步网络请求调用 OpenAI；�
 - `output_format`: `gpt-image` 系列模型的输出格式，默认 `png`
 - `stream_enabled`: 是否启用流式生图，默认开启，仅对 `gpt-image` 系列模型生效
 - `partial_images`: 流式中间图数量，默认 `1`，取值 `0-3`
+- `max_reference_images`: 改图最大参考图片数，默认 `4`，取值 `1-16`；改图时附带/引用的图片超过该数量，多余的图片会被直接丢弃
 - `background_poll_interval`: 后台任务轮询间隔，默认 5 秒，仅在 `responses_background` 图像模式下使用
 - `background_poll_timeout`: 后台任务最长等待时间，默认 300 秒，仅在 `responses_background` 图像模式下使用
 - `timeout`: 请求超时时间，默认 120 秒
@@ -47,6 +48,13 @@ AstrBot OpenAI 文生图插件。插件使用异步网络请求调用 OpenAI；�
 /改图 把背景换成海边日落，保持人物不变
 /编辑图片 改成水彩插画风格
 /edit remove the text on the poster
+```
+
+改图支持参考多张图片：在消息中附带多张图片，或引用含多张图片的消息，超出 `max_reference_images` 的图片会被丢弃。任一图片下载/解析失败时整单失败。
+
+```text
+/改图 把人物 A 的服装换到人物 B 身上
+/编辑图片 融合这两张图的风格
 ```
 
 管理员可查询 OpenAI 图片用量：

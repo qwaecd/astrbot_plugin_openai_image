@@ -179,8 +179,8 @@ class OpenaiImage(Star):
             return
 
         try:
-            image_ref = await self._extract_edit_image_ref(event)
-            if not image_ref:
+            image_refs = await self._extract_edit_image_refs(event)
+            if not image_refs:
                 await event.send(
                     MessageChain().message(
                         "请在消息中附带图片，或引用一张图片后使用 /改图 <要求>。"
@@ -190,18 +190,18 @@ class OpenaiImage(Star):
 
             logger.info(
                 "[OpenAI Image] 改图任务开始: model=%s, size=%s, quality=%s, "
-                "output_format=%s, prompt_chars=%d, image=%s, proxy=%s",
+                "output_format=%s, prompt_chars=%d, image_count=%d, proxy=%s",
                 self._get_str("model", DEFAULT_MODEL),
                 self._get_str("size", "1024x1024"),
                 self._get_str("quality", "auto"),
                 self._get_str("output_format", "png"),
                 len(prompt_text),
-                self._describe_media_ref(image_ref),
+                len(image_refs),
                 self._describe_proxy(),
             )
             await event.send(MessageChain().message("正在改图，请稍等..."))
             started_at = monotonic()
-            result = await self._edit_image(prompt_text, image_ref, api_key)
+            result = await self._edit_image(prompt_text, image_refs, api_key)
             elapsed_seconds = monotonic() - started_at
         except OpenAIImageAPIError as exc:
             await event.send(MessageChain().message(f"改图失败：{exc}"))
@@ -358,7 +358,7 @@ class OpenaiImage(Star):
         )
 
     async def _edit_image_background(
-        self, prompt: str, image_data: ImageRefData, api_key: str
+        self, prompt: str, image_data: list[ImageRefData], api_key: str
     ) -> ImageAPIResult:
         return await self._run_responses_image_task(
             prompt=prompt,
@@ -374,7 +374,7 @@ class OpenaiImage(Star):
         api_key: str,
         action: str,
         action_label: str,
-        image_data: ImageRefData | None = None,
+        image_data: list[ImageRefData] | None = None,
     ) -> ImageAPIResult:
         try:
             from openai import (
@@ -408,13 +408,13 @@ class OpenaiImage(Star):
             response_input = self._build_responses_image_input(prompt, image_data)
             logger.info(
                 "[OpenAI Image] 提交后台%s任务: api_base=%s, responses_model=%s, "
-                "image_model=%s, input_image=%s, timeout=%ss, poll_interval=%ss, "
+                "image_model=%s, input_image_count=%d, timeout=%ss, poll_interval=%ss, "
                 "poll_timeout=%ss, proxy=%s",
                 action_label,
                 api_base,
                 response_model,
                 tool.get("model", "default"),
-                "yes" if image_data is not None else "no",
+                len(image_data) if image_data else 0,
                 timeout,
                 poll_interval,
                 poll_timeout,
@@ -493,30 +493,32 @@ class OpenaiImage(Star):
             await sdk_client.close()
 
     async def _edit_image(
-        self, prompt: str, image_ref: str, api_key: str
+        self, prompt: str, image_refs: list[str], api_key: str
     ) -> ImageAPIResult:
         client = await self._ensure_client()
         timeout = self._get_int("timeout", 120)
-        image_data = await self._resolve_image_ref_data(client, image_ref, timeout)
-        image_bytes = image_data.content
-        image_mime_type = image_data.mime_type
+        image_data_list = await asyncio.gather(
+            *[self._resolve_image_ref_data(client, ref, timeout) for ref in image_refs]
+        )
         if self._get_generation_mode() == GENERATION_MODE_RESPONSES_BACKGROUND:
             logger.info(
-                "[OpenAI Image] 使用 Responses 后台改图: image_mime=%s, image_bytes=%d",
-                image_mime_type,
-                len(image_bytes),
+                "[OpenAI Image] 使用 Responses 后台改图: image_count=%d, total_bytes=%d",
+                len(image_data_list),
+                sum(len(data.content) for data in image_data_list),
             )
-            return await self._edit_image_background(prompt, image_data, api_key)
+            return await self._edit_image_background(prompt, image_data_list, api_key)
 
-        image_ext = self._extension_from_mime_type(image_mime_type)
         api_url = self._build_api_url("images/edits")
         form_data = self._build_edit_form(prompt)
         stream_enabled = self._should_stream_images()
 
         logger.info(
-            "[OpenAI Image] 已解析改图输入图片: mime=%s, bytes=%d",
-            image_mime_type,
-            len(image_bytes),
+            "[OpenAI Image] 已解析改图输入图片: count=%d, details=%s",
+            len(image_data_list),
+            ", ".join(
+                f"mime={data.mime_type},bytes={len(data.content)}"
+                for data in image_data_list
+            ),
         )
         logger.info(
             "[OpenAI Image] 发送改图请求: url=%s, timeout=%ss, proxy=%s, stream=%s",
@@ -529,8 +531,13 @@ class OpenaiImage(Star):
         files = [
             (
                 "image[]",
-                (f"image{image_ext}", image_bytes, image_mime_type),
+                (
+                    f"image{i}{self._extension_from_mime_type(data.mime_type)}",
+                    data.content,
+                    data.mime_type,
+                ),
             )
+            for i, data in enumerate(image_data_list)
         ]
         if stream_enabled:
             form_data["stream"] = "true"
@@ -974,25 +981,28 @@ class OpenaiImage(Star):
     def _build_responses_image_input(
         self,
         prompt: str,
-        image_data: ImageRefData | None,
+        image_data: list[ImageRefData] | None,
     ) -> str | list[dict[str, Any]]:
-        if image_data is None:
+        if not image_data:
             return prompt
 
-        image_url = self._image_data_to_data_url(image_data)
+        content: list[dict[str, Any]] = [
+            {
+                "type": "input_text",
+                "text": prompt,
+            }
+        ]
+        for data in image_data:
+            content.append(
+                {
+                    "type": "input_image",
+                    "image_url": self._image_data_to_data_url(data),
+                }
+            )
         return [
             {
                 "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": prompt,
-                    },
-                    {
-                        "type": "input_image",
-                        "image_url": image_url,
-                    },
-                ],
+                "content": content,
             }
         ]
 
@@ -1043,21 +1053,33 @@ class OpenaiImage(Star):
 
         return form_data
 
-    async def _extract_edit_image_ref(self, event: AstrMessageEvent) -> str | None:
+    async def _extract_edit_image_refs(self, event: AstrMessageEvent) -> list[str]:
+        raw_refs: list[str] = []
         for component in event.get_messages():
             if isinstance(component, Image):
                 image_ref = component.url or component.file
                 if image_ref:
-                    resolved = await self._resolve_image_refs_for_event(
-                        event, [image_ref]
-                    )
-                    return resolved[0] if resolved else image_ref
+                    raw_refs.append(image_ref)
 
         quoted_images = await extract_quoted_message_images(event)
-        if quoted_images:
-            return quoted_images[0]
+        raw_refs.extend(quoted_images)
 
-        return None
+        if not raw_refs:
+            return []
+
+        resolved = await self._resolve_image_refs_for_event(event, raw_refs)
+        merged = resolved if resolved else raw_refs
+
+        max_images = self._get_max_reference_images()
+        if len(merged) > max_images:
+            logger.info(
+                "[OpenAI Image] 改图参考图片数量 %d 超过上限 %d，已丢弃多余的 %d 张",
+                len(merged),
+                max_images,
+                len(merged) - max_images,
+            )
+            merged = merged[:max_images]
+        return merged
 
     async def _resolve_image_refs_for_event(
         self, event: AstrMessageEvent, image_refs: list[str]
@@ -1672,6 +1694,10 @@ class OpenaiImage(Star):
     def _get_partial_images(self) -> int:
         partial_images = self._get_int("partial_images", 1)
         return min(max(partial_images, 0), 3)
+
+    def _get_max_reference_images(self) -> int:
+        value = self._get_int("max_reference_images", 4)
+        return min(max(value, 1), 16)
 
     def _get_bool(self, key: str, default: bool = False) -> bool:
         value = self.config.get(key, default)
