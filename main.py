@@ -285,6 +285,149 @@ class OpenaiImage(Star):
             MessageChain().message(self._format_usage_summary(summary, elapsed_seconds))
         )
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("白名单添加", alias={"wl_add", "whitelist_add"})
+    async def whitelist_add(self, event: AstrMessageEvent, args: GreedyStr = ""):
+        target = str(args or "").strip()
+        if not target:
+            await event.send(
+                MessageChain().message(
+                    "请提供要添加的用户 ID，例如：/白名单添加 aiocqhttp:FriendMessage:123456\n"
+                    "可使用 /sid 查看 UID/UMO/Session ID。"
+                )
+            )
+            return
+
+        whitelist = self._get_list("whitelist_users")
+        if target in whitelist:
+            await event.send(
+                MessageChain().message(
+                    f"{target} 已在白名单中，当前共 {len(whitelist)} 个。"
+                )
+            )
+            return
+
+        whitelist.append(target)
+        self._set_whitelist_users(whitelist)
+        logger.info(
+            "[OpenAI Image] 管理员添加白名单: target=%s, total=%d, admin=%s",
+            target,
+            len(whitelist),
+            str(event.get_sender_id()).strip() or "unknown",
+        )
+        await event.send(
+            MessageChain().message(
+                f"已添加 {target} 到白名单，当前共 {len(whitelist)} 个。"
+            )
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("白名单移除", alias={"wl_remove", "whitelist_remove"})
+    async def whitelist_remove(self, event: AstrMessageEvent, args: GreedyStr = ""):
+        target = str(args or "").strip()
+        if not target:
+            await event.send(
+                MessageChain().message(
+                    "请提供要移除的用户 ID，例如：/白名单移除 aiocqhttp:FriendMessage:123456"
+                )
+            )
+            return
+
+        whitelist = self._get_list("whitelist_users")
+        if target not in whitelist:
+            await event.send(
+                MessageChain().message(
+                    f"{target} 不在白名单中，当前共 {len(whitelist)} 个。"
+                )
+            )
+            return
+
+        whitelist = [item for item in whitelist if item != target]
+        self._set_whitelist_users(whitelist)
+        logger.info(
+            "[OpenAI Image] 管理员移除白名单: target=%s, total=%d, admin=%s",
+            target,
+            len(whitelist),
+            str(event.get_sender_id()).strip() or "unknown",
+        )
+        await event.send(
+            MessageChain().message(
+                f"已从白名单移除 {target}，当前共 {len(whitelist)} 个。"
+            )
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("白名单列表", alias={"wl_list", "whitelist_list"})
+    async def whitelist_list(self, event: AstrMessageEvent):
+        whitelist = self._get_list("whitelist_users")
+        enabled = self._get_bool("whitelist_enabled", False)
+        if not whitelist:
+            await event.send(
+                MessageChain().message(
+                    f"白名单当前为空（状态：{'已开启' if enabled else '已关闭'}）。"
+                )
+            )
+            return
+
+        lines = [f"白名单（{'已开启' if enabled else '已关闭'}，共 {len(whitelist)} 个）："]
+        for index, item in enumerate(whitelist, 1):
+            lines.append(f"{index}. {item}")
+        await event.send(MessageChain().message("\n".join(lines)))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("白名单开关", alias={"wl_toggle", "whitelist_toggle"})
+    async def whitelist_toggle(self, event: AstrMessageEvent, args: GreedyStr = ""):
+        arg = str(args or "").strip().lower()
+        current = self._get_bool("whitelist_enabled", False)
+
+        if arg in {"on", "1", "true", "开", "开启", "启用", "打开"}:
+            new_value = True
+        elif arg in {"off", "0", "false", "关", "关闭", "禁用", "关掉"}:
+            new_value = False
+        elif arg:
+            await event.send(
+                MessageChain().message(
+                    "参数无效，用法：\n"
+                    "/白名单开关 on  开启白名单\n"
+                    "/白名单开关 off 关闭白名单\n"
+                    "/白名单开关     切换当前状态"
+                )
+            )
+            return
+        else:
+            new_value = not current
+
+        if new_value == current:
+            await event.send(
+                MessageChain().message(
+                    f"白名单当前已是{'开启' if new_value else '关闭'}状态，无需重复操作。"
+                )
+            )
+            return
+
+        self._set_whitelist_enabled(new_value)
+        logger.info(
+            "[OpenAI Image] 管理员切换白名单开关: %s -> %s, admin=%s, arg=%s",
+            current,
+            new_value,
+            str(event.get_sender_id()).strip() or "unknown",
+            arg or "toggle",
+        )
+        count = len(self._get_list("whitelist_users"))
+        if new_value and count == 0:
+            await event.send(
+                MessageChain().message(
+                    "白名单已开启，但白名单列表为空，不会限制任何用户。"
+                    "请使用 /白名单添加 <ID> 添加用户。"
+                )
+            )
+        else:
+            await event.send(
+                MessageChain().message(
+                    f"白名单已{'开启' if new_value else '关闭'}，当前白名单共 {count} 个。"
+                )
+            )
+
     async def _create_image(self, prompt: str, api_key: str) -> ImageAPIResult:
         generation_mode = self._get_generation_mode()
         if generation_mode == GENERATION_MODE_RESPONSES_BACKGROUND:
@@ -1648,6 +1791,14 @@ class OpenaiImage(Star):
         umo = str(event.unified_msg_origin).strip()
         candidates = {item for item in (sender_id, session_id, umo) if item}
         return bool(candidates & whitelist)
+
+    def _set_whitelist_users(self, users: list[str]) -> None:
+        self.config["whitelist_users"] = users
+        self.config.save_config()
+
+    def _set_whitelist_enabled(self, enabled: bool) -> None:
+        self.config["whitelist_enabled"] = enabled
+        self.config.save_config()
 
     def _get_str(self, key: str, default: str = "") -> str:
         value = self.config.get(key, default)

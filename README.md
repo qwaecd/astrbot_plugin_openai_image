@@ -80,6 +80,23 @@ git clone https://github.com/qwaecd/astrbot_plugin_openai_image
 
 需要 AstrBot 管理员权限。`admin_api_key` 需填写 OpenAI Organization Admin API Key，插件会调用 `/v1/organization/usage/images` 查询图片用量，并尽量调用 `/v1/organization/costs` 附带同周期组织费用汇总。费用接口返回的是组织同周期 API 总费用，不一定只包含图片接口。
 
+### 白名单管理（管理员）
+
+无需打开 WebUI 后台，可直接在聊天中管理用户白名单。ID 可使用 `/sid` 指令查看 UID/UMO/Session ID。
+
+```text
+/白名单添加 aiocqhttp:FriendMessage:123456
+/白名单移除 123456
+/白名单列表
+/白名单开关 on
+/白名单开关 off
+/白名单开关
+```
+
+- `/白名单开关 on` 开启白名单，`/白名单开关 off` 关闭白名单，`/白名单开关`（不带参数）切换当前状态。参数兼容中文"开/关/开启/关闭"等。
+- 开启但列表为空时不会限制任何用户。
+- 这些指令仅 AstrBot 管理员可用，写入会立即持久化到插件配置文件，WebUI 后台同步可见。
+
 ## 指令一览
 
 | 指令 | 别名 | 权限 | 说明 |
@@ -87,6 +104,10 @@ git clone https://github.com/qwaecd/astrbot_plugin_openai_image
 | `/画图 <提示词>` | `生图`、`image`、`draw` | 全部用户 | 文生图 |
 | `/改图 <要求>` | `编辑图片`、`edit`、`edit_image` | 全部用户 | 改图，需附带或引用图片 |
 | `/图片用量 [天数]` | `openai_usage`、`image_usage`、`生图用量` | AstrBot 管理员 | 查询最近 N 天（默认 7，最大 180）图片用量与费用 |
+| `/白名单添加 <ID>` | `wl_add`、`whitelist_add` | AstrBot 管理员 | 添加用户到白名单并持久化 |
+| `/白名单移除 <ID>` | `wl_remove`、`whitelist_remove` | AstrBot 管理员 | 从白名单移除用户并持久化 |
+| `/白名单列表` | `wl_list`、`whitelist_list` | AstrBot 管理员 | 查看白名单状态与全部 ID |
+| `/白名单开关 [on/off]` | `wl_toggle`、`whitelist_toggle` | AstrBot 管理员 | 开启/关闭/切换白名单状态并持久化 |
 
 ## 配置
 
